@@ -25,6 +25,7 @@ export const goOptions = {
     justTypesAndPackage: new BooleanOption("just-types-and-package", "Plain types with package only", false),
     packageName: new StringOption("package", "Generated package name", "NAME", "main"),
     multiFileOutput: new BooleanOption("multi-file-output", "Renders each top-level object in its own Go file", false),
+    pointersForOptionalValues: new BooleanOption("pointers-for-optional-values", "Use pointers for optional values", true),
 };
 
 export class GoTargetLanguage extends TargetLanguage {
@@ -33,7 +34,7 @@ export class GoTargetLanguage extends TargetLanguage {
     }
 
     protected getOptions(): Option<any>[] {
-        return [goOptions.justTypes, goOptions.packageName, goOptions.multiFileOutput, goOptions.justTypesAndPackage];
+        return [goOptions.justTypes, goOptions.packageName, goOptions.multiFileOutput, goOptions.justTypesAndPackage, goOptions.pointersForOptionalValues];
     }
 
     get supportsUnionsWithBothNumberTypes(): boolean {
@@ -72,6 +73,7 @@ function goNameStyle(original: string): string {
 }
 
 const primitiveValueTypeKinds: TypeKind[] = ["integer", "double", "bool", "string"];
+type PrimitiveValueKind = typeof primitiveValueTypeKinds[number];
 const compoundTypeKinds: TypeKind[] = ["array", "class", "map", "enum"];
 
 function isValueType(t: Type): boolean {
@@ -170,7 +172,7 @@ export class GoRenderer extends ConvenienceRenderer {
 
     private nullableGoType(t: Type, withIssues: boolean): Sourcelike {
         const goType = this.goType(t, withIssues);
-        if (isValueType(t)) {
+        if (isValueType(t) && this._options.pointersForOptionalValues) {
             return ["*", goType];
         } else {
             return goType;
@@ -305,19 +307,30 @@ export class GoRenderer extends ConvenienceRenderer {
             return f(maybeType, this.nameForUnionMember(u, maybeType), this.goType(maybeType));
         };
 
-        const maybeAssignNil = (kind: TypeKind): void => {
-            ifMember(kind, undefined, (_1, fieldName, _2) => {
-                this.emitLine("x.", fieldName, " = nil");
-            });
-        };
+        const primitiveZeroValue: (kind: PrimitiveValueKind) => string = (kind) => {
+            switch (kind) {
+                case "integer":
+                case "double":
+                    return "0";
+                case "bool":
+                    return "false";
+                case "string":
+                    return `""`;
+                default:
+                    throw Error("not a primitive type");
+            }
+        }
+
         const makeArgs = (
             primitiveArg: (fieldName: Sourcelike) => Sourcelike,
-            compoundArg: (isClass: boolean, fieldName: Sourcelike) => Sourcelike
+            compoundArg: (isClass: boolean, fieldName: Sourcelike) => Sourcelike,
+            dereference: boolean,
         ): Sourcelike => {
             const args: Sourcelike = [];
             for (const kind of primitiveValueTypeKinds) {
+                const isPointer = dereference || this._options.pointersForOptionalValues;
                 args.push(
-                    ifMember(kind, "nil", (_1, fieldName, _2) => primitiveArg(fieldName)),
+                    ifMember(kind, isPointer ? "nil" : primitiveZeroValue(kind), (_1, fieldName, _2) => primitiveArg(fieldName)),
                     ", "
                 );
             }
@@ -343,9 +356,7 @@ export class GoRenderer extends ConvenienceRenderer {
 
         this.ensureBlankLine();
         this.emitFunc(["(x *", unionName, ") UnmarshalJSON(data []byte) error"], () => {
-            for (const kind of compoundTypeKinds) {
-                maybeAssignNil(kind);
-            }
+            this.emitLine("*x = ", unionName, "{}");
             ifMember("class", undefined, (_1, _2, goType) => {
                 this.emitLine("var c ", goType);
             });
@@ -357,7 +368,8 @@ export class GoRenderer extends ConvenienceRenderer {
                     } else {
                         return ["true, &x.", fn];
                     }
-                }
+                },
+                true
             );
             this.emitLine("object, err := unmarshalUnion(data, ", args, ")");
             this.emitBlock("if err != nil", () => {
@@ -365,7 +377,11 @@ export class GoRenderer extends ConvenienceRenderer {
             });
             this.emitBlock("if object", () => {
                 ifMember("class", undefined, (_1, fieldName, _2) => {
-                    this.emitLine("x.", fieldName, " = &c");
+                    if (this._options.pointersForOptionalValues) {
+                        this.emitLine("x.", fieldName, " = &c");
+                    } else {
+                        this.emitLine("x.", fieldName, " = c");
+                    }
                 });
             });
             this.emitLine("return nil");
@@ -374,7 +390,14 @@ export class GoRenderer extends ConvenienceRenderer {
         this.emitFunc(["(x *", unionName, ") MarshalJSON() ([]byte, error)"], () => {
             const args = makeArgs(
                 (fn) => ["x.", fn],
-                (_, fn) => ["x.", fn, " != nil, x.", fn]
+                (_, fn) => {
+                    if (this._options.pointersForOptionalValues) {
+                        return ["x.", fn, " != nil",", x.", fn];
+                    } else {
+                        return ["reflect.ValueOf(x.", fn, ").IsZero(), x.", fn];
+                    }
+                },
+                false
             );
             this.emitLine("return marshalUnion(", args, ")");
         });
@@ -410,6 +433,10 @@ export class GoRenderer extends ConvenienceRenderer {
             if (includeJSONEncodingImport) {
                 this.emitLineOnce('import "encoding/json"');
             }
+
+            if (this.haveNamedUnions && !this._options.pointersForOptionalValues) {
+                this.emitLineOnce('import "reflect"');
+            }
             this.ensureBlankLine();
         }
     }
@@ -423,8 +450,10 @@ export class GoRenderer extends ConvenienceRenderer {
                 this.emitLineOnce('import "errors"');
             }
             this.ensureBlankLine();
-            this
-                .emitMultiline(`func unmarshalUnion(data []byte, pi **int64, pf **float64, pb **bool, ps **string, haveArray bool, pa interface{}, haveObject bool, pc interface{}, haveMap bool, pm interface{}, haveEnum bool, pe interface{}, nullable bool) (bool, error) {
+
+            if (this._options.pointersForOptionalValues) {
+                this
+                    .emitMultiline(`func unmarshalUnion(data []byte, pi **int64, pf **float64, pb **bool, ps **string, haveArray bool, pa interface{}, haveObject bool, pc interface{}, haveMap bool, pm interface{}, haveEnum bool, pe interface{}, nullable bool) (bool, error) {
     if pi != nil {
         *pi = nil
     }
@@ -537,6 +566,122 @@ func marshalUnion(pi *int64, pf *float64, pb *bool, ps *string, haveArray bool, 
     }
     return nil, errors.New("Union must not be null")
 }`);
+            } else {
+                this
+                    .emitMultiline(`func unmarshalUnion(data []byte, pi *int64, pf *float64, pb *bool, ps *string, haveArray bool, pa interface{}, haveObject bool, pc interface{}, haveMap bool, pm interface{}, haveEnum bool, pe interface{}, nullable bool) (bool, error) {
+	if pi != nil {
+		*pi = 0
+	}
+	if pf != nil {
+		*pf = 0
+	}
+	if pb != nil {
+		*pb = false
+	}
+	if ps != nil {
+		*ps = ""
+	}
+
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	tok, err := dec.Token()
+	if err != nil {
+		return false, err
+	}
+
+	switch v := tok.(type) {
+	case json.Number:
+		if pi != nil {
+			i, err := v.Int64()
+			if err == nil {
+				*pi = i
+				return false, nil
+			}
+		}
+		if pf != nil {
+			f, err := v.Float64()
+			if err == nil {
+				*pf = f
+				return false, nil
+			}
+			return false, errors.New("Unparsable number")
+		}
+		return false, errors.New("Union does not contain number")
+	case float64:
+		return false, errors.New("Decoder should not return float64")
+	case bool:
+		if pb != nil {
+			*pb = v
+			return false, nil
+		}
+		return false, errors.New("Union does not contain bool")
+	case string:
+		if haveEnum {
+			return false, json.Unmarshal(data, pe)
+		}
+		if ps != nil {
+			*ps = v
+			return false, nil
+		}
+		return false, errors.New("Union does not contain string")
+	case nil:
+		if nullable {
+			return false, nil
+		}
+		return false, errors.New("Union does not contain null")
+	case json.Delim:
+		if v == '{' {
+			if haveObject {
+				return true, json.Unmarshal(data, pc)
+			}
+			if haveMap {
+				return false, json.Unmarshal(data, pm)
+			}
+			return false, errors.New("Union does not contain object")
+		}
+		if v == '[' {
+			if haveArray {
+				return false, json.Unmarshal(data, pa)
+			}
+			return false, errors.New("Union does not contain array")
+		}
+		return false, errors.New("Cannot handle delimiter")
+	}
+	return false, errors.New("Cannot unmarshal union")
+
+}
+
+func marshalUnion(pi int64, pf float64, pb bool, ps string, haveArray bool, pa interface{}, haveObject bool, pc interface{}, haveMap bool, pm interface{}, haveEnum bool, pe interface{}, nullable bool) ([]byte, error) {
+	if pi != 0 {
+		return json.Marshal(pi)
+	}
+	if pf != 0 {
+		return json.Marshal(pf)
+	}
+	if pb != false {
+		return json.Marshal(pb)
+	}
+	if ps != "" {
+		return json.Marshal(ps)
+	}
+	if haveArray {
+		return json.Marshal(pa)
+	}
+	if haveObject {
+		return json.Marshal(pc)
+	}
+	if haveMap {
+		return json.Marshal(pm)
+	}
+	if haveEnum {
+		return json.Marshal(pe)
+	}
+	if nullable {
+		return json.Marshal(nil)
+	}
+	return nil, errors.New("Union must not be null")
+}`);
+            }
             this.endFile();
         }
     }
